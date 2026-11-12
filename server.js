@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -8,35 +9,43 @@ const io = new Server(server);
 
 app.use(express.static(__dirname));
 
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
+
 let rooms = {};
 
 io.on('connection', (socket) => {
-    console.log('มีผู้เล่นเชื่อมต่อเข้ามา:', socket.id);
+    console.log('ผู้เล่นเชื่อมต่อ:', socket.id);
 
     socket.on('join-room', (roomId) => {
         socket.join(roomId);
+        
         if (!rooms[roomId]) {
-            rooms[roomId] = { players: {}, gameStarted: false };
+            rooms[roomId] = { p1: null, p2: null, players: {}, timeLeft: 60, timer: null };
         }
 
         let room = rooms[roomId];
-        let existingIds = Object.keys(room.players);
+        let role = '';
 
-        if (existingIds.length >= 2) {
+        if (!room.p1) {
+            room.p1 = socket.id;
+            role = 'p1';
+        } else if (!room.p2 && room.p1 !== socket.id) {
+            room.p2 = socket.id;
+            role = 'p2';
+        } else {
             socket.emit('room-full');
             return;
         }
 
-        // ผู้เล่นที่เข้ามาก่อนคนแรกจะได้เป็น p1 คนที่สองจะได้เป็น p2
-        let role = existingIds.length === 0 ? 'p1' : 'p2';
-        
+        // ปรับค่าพลังชีวิต (HP) เริ่มต้นเป็น 1000 ตามตัวเกมล่าสุด
         room.players[socket.id] = { 
-            id: socket.id,
             role: role, 
             x: role === 'p1' ? 200 : 750, 
             y: 460, 
-            hp: 250, 
-            maxHp: 250,
+            hp: 1000, 
+            maxHp: 1000,
             energy: 0,
             facingRight: role === 'p1',
             isBlocking: false,
@@ -45,19 +54,32 @@ io.on('connection', (socket) => {
             attackType: null
         };
 
-        socket.emit('assigned-role', { role, roomId });
-        io.to(roomId).emit('update-players', room.players);
+        socket.emit('assigned-role', { role: role });
 
-        if (Object.keys(room.players).length === 2 && !room.gameStarted) {
-            room.gameStarted = true;
+        if (room.p1 && room.p2) {
             io.to(roomId).emit('start-countdown');
+
+            if (!room.timer) {
+                room.timer = setInterval(() => {
+                    if (room && room.timeLeft > 0) {
+                        room.timeLeft--;
+                        io.to(roomId).emit('update-timer', room.timeLeft);
+                    } else {
+                        if (room && room.timer) {
+                            clearInterval(room.timer);
+                            room.timer = null;
+                        }
+                        io.to(roomId).emit('time-up');
+                    }
+                }, 1000);
+            }
         }
     });
 
     socket.on('player-action', (data) => {
-        let roomId = data.roomId;
-        if (rooms[roomId] && rooms[roomId].players[socket.id]) {
-            let p = rooms[roomId].players[socket.id];
+        let room = rooms[data.roomId];
+        if (room && room.players[socket.id]) {
+            let p = room.players[socket.id];
             p.x = data.x;
             p.y = data.y;
             p.facingRight = data.facingRight;
@@ -66,51 +88,48 @@ io.on('connection', (socket) => {
             p.isUltimate = data.isUltimate;
             p.attackType = data.attackType;
 
-            socket.to(roomId).emit('update-players', rooms[roomId].players);
+            io.to(data.roomId).emit('update-players', room.players);
         }
     });
 
     socket.on('player-attack', (data) => {
-        let roomId = data.roomId;
-        if (!rooms[roomId]) return;
-        
-        let room = rooms[roomId];
-        let attacker = room.players[socket.id];
-        if (!attacker) return;
+        let room = rooms[data.roomId];
+        if (!room) return;
 
-        let opponentSocketId = Object.keys(room.players).find(id => id !== socket.id);
-        if (!opponentSocketId) return;
-        let opponent = room.players[opponentSocketId];
+        let targetSocketId = (data.targetRole === 'p1') ? room.p1 : room.p2;
+        let attackerSocketId = (socket.id === room.p1) ? room.p1 : room.p2;
 
-        let damage = data.damage || (data.attackType === 'ultimate' ? 75 : (data.attackType === 'jumpkick' ? 18 : 10));
-        let isUlt = (data.attackType === 'ultimate');
+        let target = room.players[targetSocketId];
+        let attacker = room.players[attackerSocketId];
 
-        opponent.hp = Math.max(0, opponent.hp - damage);
-        attacker.energy = Math.min(100, attacker.energy + (isUlt ? 0 : 18));
+        if (target && attacker) {
+            let isUlt = (data.attackType === 'ultimate');
+            target.hp = Math.max(0, target.hp - data.damage);
 
-        io.to(roomId).emit('apply-hit', {
-            targetRole: opponent.role,
-            damage: damage,
-            isUltimate: isUlt,
-            x: opponent.x,
-            y: opponent.y
-        });
-        io.to(roomId).emit('update-players', room.players);
+            if (!isUlt) {
+                attacker.energy = Math.min(100, (attacker.energy || 0) + 25);
+            } else {
+                attacker.energy = 0;
+            }
+
+            io.to(data.roomId).emit('apply-hit', {
+                targetRole: data.targetRole,
+                damage: data.damage,
+                isUltimate: isUlt
+            });
+
+            io.to(data.roomId).emit('update-players', room.players);
+        }
     });
 
     socket.on('disconnect', () => {
-        console.log('ผู้เล่นออกจากการเชื่อมต่อ:', socket.id);
+        console.log('ผู้เล่นตัดการเชื่อมต่อ:', socket.id);
         for (let roomId in rooms) {
             let room = rooms[roomId];
-            if (room.players[socket.id]) {
-                delete room.players[socket.id];
-                room.gameStarted = false;
-                io.to(roomId).emit('update-players', room.players);
-                io.to(roomId).emit('opponent-disconnected');
-                if (Object.keys(room.players).length === 0) {
-                    delete rooms[roomId];
-                }
-                break;
+            if (room.p1 === socket.id || room.p2 === socket.id) {
+                if (room.timer) clearInterval(room.timer);
+                delete rooms[roomId];
+                io.to(roomId).emit('room-full');
             }
         }
     });
@@ -118,5 +137,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`เซิร์ฟเวอร์เกมออนไลน์กำลังทำงานที่พอร์ต: ${PORT}`);
+    console.log(`Server เปิดใช้งานแล้วที่พอร์ต ${PORT}`);
 });
